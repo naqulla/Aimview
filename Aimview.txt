@@ -1,0 +1,1914 @@
+-- Hackers Battlegrounds | TriggerBot v3.0
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
+
+local LP        = Players.LocalPlayer
+local PlayerGui = LP:WaitForChild("PlayerGui")
+local Mouse     = LP:GetMouse()
+
+-- Remove existing GUI if present (both locations)
+if PlayerGui:FindFirstChild("HB_TriggerBot") then
+    PlayerGui.HB_TriggerBot:Destroy()
+end
+local cg = game:GetService("CoreGui")
+if cg:FindFirstChild("HB_TriggerBot") then
+    cg.HB_TriggerBot:Destroy()
+end
+
+local CFG = {
+    Enabled       = false,
+    HoldMode      = false,
+    ActivationKey = Enum.KeyCode.CapsLock,
+    HoldKey       = Enum.KeyCode.E,
+    MenuKey       = Enum.KeyCode.RightControl,
+    Delay         = 0.02,
+    TeamCheck     = true,
+    KnockCheck    = true,
+    KnifeCheck    = false,
+    MaxDistance   = 9999,
+    AimPart       = "ANY",
+    PredictStrength  = 1.0,
+    StreamerMode     = false,
+    FpsBoost         = false,
+}
+
+-- ============================================================
+-- COMBAT (Da Hills - uses Workspace.Players.NAME.Hitbox.Middle)
+-- ============================================================
+local fireDeb   = false
+local loopConn  = nil
+local VIM       = game:GetService("VirtualInputManager")
+local CAM       = workspace.CurrentCamera
+
+-- Da Hills stores hitboxes at Workspace.Players.PLAYERNAME.Hitbox.Middle
+local wsPlayers = workspace:FindFirstChild("Players")
+
+local function getHitbox(p)
+    if not wsPlayers then wsPlayers = workspace:FindFirstChild("Players") end
+    if not wsPlayers then return nil end
+    local folder = wsPlayers:FindFirstChild(p.Name)
+    if not folder then return nil end
+    local hb = folder:FindFirstChild("Hitbox")
+    if not hb then return nil end
+    return hb:FindFirstChild("Middle") or hb:FindFirstChildOfClass("BasePart")
+end
+
+local function hasKnife()
+    local char = LP.Character
+    if not char then return false end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if not tool then return false end
+    local n = tool.Name:lower()
+    return n:find("knife") or n:find("blade") or n:find("shiv")
+        or n:find("switch") or n:find("dagger") or n:find("cutter")
+end
+
+-- ── Cached part map ─────────────────────────────────────────
+-- key   = BasePart  (any part of an enemy body or their hitbox folder)
+-- value = { hitbox = BasePart, player = Player, hrp = BasePart }
+-- Rebuilt per-player only on CharacterAdded / CharacterRemoving
+local partToEnemy = {}  -- part -> entry
+local playerParts = {}  -- player -> { list of parts } for fast wipe
+
+local function clearPlayer(p)
+    local list = playerParts[p]
+    if list then
+        for i = 1, #list do
+            partToEnemy[list[i]] = nil
+        end
+        playerParts[p] = nil
+    end
+end
+
+local function buildPlayer(p)
+    clearPlayer(p)
+    if not p.Character then return end
+    local hitbox = getHitbox(p)
+    if not hitbox then return end
+    local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    local entry = { hitbox = hitbox, player = p, hrp = hrp }
+    local list  = {}
+
+    -- character body parts
+    for _, v in ipairs(p.Character:GetDescendants()) do
+        if v:IsA("BasePart") then
+            partToEnemy[v] = entry
+            list[#list+1]  = v
+        end
+    end
+    -- hitbox folder parts
+    if hitbox.Parent then
+        for _, v in ipairs(hitbox.Parent:GetDescendants()) do
+            if v:IsA("BasePart") and not partToEnemy[v] then
+                partToEnemy[v] = entry
+                list[#list+1]  = v
+            end
+        end
+    end
+    partToEnemy[hitbox] = entry
+    list[#list+1] = hitbox
+
+    playerParts[p] = list
+end
+
+local cacheConns = {}
+local charConns  = {}  -- per-character DescendantAdded/Removed listeners
+
+local function hookCharacter(p, char)
+    -- disconnect old char-level listeners
+    if charConns[p] then
+        for _, c in ipairs(charConns[p]) do c:Disconnect() end
+    end
+    charConns[p] = {}
+
+    -- grab/wait for hitbox and hrp so new parts slot into the right entry
+    local function getEntry()
+        local hitbox = getHitbox(p)
+        local hrp    = char:FindFirstChild("HumanoidRootPart")
+        if not hitbox or not hrp then return nil end
+        -- reuse existing entry if already built, otherwise make a fresh one
+        local existing = playerParts[p] and partToEnemy[playerParts[p][1]]
+        if existing and existing.hitbox == hitbox then
+            return existing
+        end
+        return { hitbox = hitbox, player = p, hrp = hrp }
+    end
+
+    -- when a new part streams into the character, add it immediately
+    table.insert(charConns[p], char.DescendantAdded:Connect(function(v)
+        if not v:IsA("BasePart") then return end
+        local entry = getEntry()
+        if not entry then return end
+        partToEnemy[v] = entry
+        local list = playerParts[p]
+        if list then list[#list+1] = v end
+    end))
+
+    -- when a part is removed, clear it from the map so stale lookups return nil
+    table.insert(charConns[p], char.DescendantRemoving:Connect(function(v)
+        if v:IsA("BasePart") then
+            partToEnemy[v] = nil
+        end
+    end))
+
+    -- also watch the ws hitbox folder for streaming parts
+    if not wsPlayers then wsPlayers = workspace:FindFirstChild("Players") end
+    local folder = wsPlayers and wsPlayers:FindFirstChild(p.Name)
+    local hbFolder = folder and folder:FindFirstChild("Hitbox")
+    if hbFolder then
+        table.insert(charConns[p], hbFolder.DescendantAdded:Connect(function(v)
+            if not v:IsA("BasePart") then return end
+            local entry = getEntry()
+            if not entry then return end
+            partToEnemy[v] = entry
+            local list = playerParts[p]
+            if list then list[#list+1] = v end
+        end))
+        table.insert(charConns[p], hbFolder.DescendantRemoving:Connect(function(v)
+            if v:IsA("BasePart") then partToEnemy[v] = nil end
+        end))
+    end
+end
+
+local function hookPlayer(p)
+    if cacheConns[p] then
+        for _, c in ipairs(cacheConns[p]) do c:Disconnect() end
+    end
+    cacheConns[p] = {
+        p.CharacterAdded:Connect(function(char)
+            task.defer(function()
+                buildPlayer(p)
+                hookCharacter(p, char)
+            end)
+        end),
+        p.CharacterRemoving:Connect(function()
+            clearPlayer(p)
+            if charConns[p] then
+                for _, c in ipairs(charConns[p]) do c:Disconnect() end
+                charConns[p] = nil
+            end
+        end),
+    }
+    if p.Character then
+        task.defer(function()
+            buildPlayer(p)
+            hookCharacter(p, p.Character)
+        end)
+    end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= LP then hookPlayer(p) end
+end
+Players.PlayerAdded:Connect(hookPlayer)
+Players.PlayerRemoving:Connect(function(p)
+    clearPlayer(p)
+    if cacheConns[p] then
+        for _, c in ipairs(cacheConns[p]) do c:Disconnect() end
+        cacheConns[p] = nil
+    end
+    if charConns[p] then
+        for _, c in ipairs(charConns[p]) do c:Disconnect() end
+        charConns[p] = nil
+    end
+end)
+
+-- ── Velocity prediction ─────────────────────────────────────
+-- Tracks each enemy hrp position over time to estimate where
+-- they'll be when the shot actually lands (accounts for ping/delay)
+local velHistory = {}  -- player -> { pos, time } ring buffer (2 samples)
+
+local function updateVelocity(entry)
+    local p   = entry.player
+    local hrp = entry.hrp
+    if not hrp then return end
+    local now = tick()
+    local prev = velHistory[p]
+    velHistory[p] = { pos = hrp.Position, t = now }
+    if not prev then return Vector3.zero end
+    local dt = now - prev.t
+    if dt <= 0 then return Vector3.zero end
+    return (hrp.Position - prev.pos) / dt  -- studs/sec
+end
+
+local function getPredictedPos(entry, latency)
+    local vel = updateVelocity(entry)
+    -- clamp prediction so it doesn't overshoot on lagspikes
+    local safeLat = math.clamp(latency * CFG.PredictStrength, 0, 0.25)
+    return entry.hitbox.Position + vel * safeLat
+end
+
+-- ── Per-frame logic ───────────────────────────────────────────
+-- Cache LP root once per loop tick to avoid repeated FindFirstChild
+local lpRoot = nil
+LP.CharacterAdded:Connect(function(c)
+    lpRoot = c:WaitForChild("HumanoidRootPart", 5)
+end)
+LP.CharacterRemoving:Connect(function() lpRoot = nil end)
+if LP.Character then
+    lpRoot = LP.Character:FindFirstChild("HumanoidRootPart")
+end
+
+local function getMouseTarget()
+    local target = Mouse.Target
+    if not target then return nil end
+
+    local entry = partToEnemy[target]
+    if not entry then return nil end
+
+    local p = entry.player
+    if not p.Character then return nil end
+    if CFG.TeamCheck and p.Team and LP.Team and p.Team == LP.Team then return nil end
+
+    -- health check: cache humanoid on entry to avoid FindFirstChildWhichIsA every tick
+    if not entry.hum or not entry.hum.Parent then
+        entry.hum = p.Character:FindFirstChildWhichIsA("Humanoid")
+    end
+    if not entry.hum then return nil end
+    if CFG.KnockCheck and entry.hum.Health <= 0 then return nil end
+
+    if not lpRoot then return nil end
+    if (entry.hrp.Position - lpRoot.Position).Magnitude > CFG.MaxDistance then return nil end
+
+    return entry
+end
+
+local function isFreeCam()
+    local ct = CAM.CameraType
+    return ct ~= Enum.CameraType.Custom
+        and ct ~= Enum.CameraType.Follow
+end
+
+local function isSafeToFire()
+    if isFreeCam() then return false end
+    if not lpRoot or not lpRoot.Parent then return false end
+    return true
+end
+
+local function doFire(entry, latency)
+    if fireDeb then return end
+    if not isSafeToFire() then return end
+    fireDeb = true
+
+    local predictedPos = getPredictedPos(entry, latency)
+    local sp = CAM:WorldToScreenPoint(predictedPos)
+
+    local realPos = UserInputService:GetMouseLocation()
+
+    pcall(VIM.SendMouseButtonEvent, VIM, sp.X, sp.Y, 0, true,  game, 1)
+    pcall(VIM.SendMouseButtonEvent, VIM, sp.X, sp.Y, 0, false, game, 1)
+    pcall(VIM.SendMouseMoveEvent, VIM, realPos.X, realPos.Y, game)
+
+    task.delay(0.08, function() fireDeb = false end)
+end
+
+local function isActive()
+    if isFreeCam() then return false end
+    if CFG.KnifeCheck and hasKnife() then return false end  -- block trigger while knife is out
+    if CFG.HoldMode then
+        return UserInputService:IsKeyDown(CFG.HoldKey)
+    else
+        return CFG.Enabled
+    end
+end
+
+-- ── Main loop ────────────────────────────────────────────────
+-- Runs at 20hz — enough for a triggerbot, easy on low-end PCs
+-- Prediction latency is estimated from ping + configured delay
+local TICK_RATE  = 0.05
+local lastTick   = 0
+
+local function startLoop()
+    if loopConn then loopConn:Disconnect() end
+    loopConn = RunService.Heartbeat:Connect(function(dt)
+        lastTick = lastTick + dt
+        if lastTick < TICK_RATE then return end
+        lastTick = 0
+
+        if not isActive() then return end
+
+        local entry = getMouseTarget()
+        if not entry then return end
+
+        -- estimate total latency: server ping + fire delay
+        local ping    = Players.LocalPlayer:GetNetworkPing()
+        local latency = ping + CFG.Delay
+
+        if CFG.Delay > 0 then
+            task.delay(CFG.Delay, function()
+                if not isActive() then return end
+                local e2 = getMouseTarget()
+                if e2 then doFire(e2, latency) end
+            end)
+        else
+            doFire(entry, latency)
+        end
+    end)
+end
+
+-- ============================================================
+-- FPS BOOSTER
+-- ============================================================
+local fpsOriginals = {}
+
+local function applyFpsBoost(on)
+    local ls  = game:GetService("Lighting")
+    local StarterGui = game:GetService("StarterGui")
+    if on then
+        -- save originals
+        fpsOriginals.shadows    = ls.GlobalShadows
+        fpsOriginals.fogEnd     = ls.FogEnd
+        fpsOriginals.fogStart   = ls.FogStart
+        fpsOriginals.brightness = ls.Brightness
+        fpsOriginals.ambient    = ls.Ambient
+        fpsOriginals.outAmbient = ls.OutdoorAmbient
+
+        -- lower render quality
+        pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+
+        -- kill shadows
+        ls.GlobalShadows = false
+
+        -- kill fog
+        ls.FogEnd   = 100000
+        ls.FogStart = 99999
+
+        -- remove all Lighting effects (bloom, blur, sunrays, etc.)
+        for _, v in ipairs(ls:GetChildren()) do
+            if v:IsA("PostEffect") or v:IsA("Sky") or v:IsA("Atmosphere") then
+                fpsOriginals[v] = v.Parent  -- remember it
+                v.Parent = nil
+            end
+        end
+
+        -- hide ALL beam/trail/particle effects in workspace (gun tracers etc.)
+        for _, v in ipairs(workspace:GetDescendants()) do
+            if v:IsA("Beam") or v:IsA("Trail") or v:IsA("ParticleEmitter") or v:IsA("Smoke") or v:IsA("Fire") or v:IsA("Sparkles") then
+                pcall(function()
+                    fpsOriginals[v] = v.Enabled ~= nil and v.Enabled or true
+                    if v:IsA("Beam") or v:IsA("Trail") then
+                        v.Enabled = false
+                    elseif v.Parent then
+                        v:Emit(0)
+                        v.Enabled = false
+                    end
+                end)
+            end
+        end
+
+        -- watch for new beams/trails/particles added at runtime (guns being fired)
+        fpsOriginals.descConn = workspace.DescendantAdded:Connect(function(v)
+            if v:IsA("Beam") or v:IsA("Trail") or v:IsA("ParticleEmitter") or v:IsA("Smoke") or v:IsA("Fire") or v:IsA("Sparkles") then
+                pcall(function() v.Enabled = false end)
+            end
+        end)
+
+    else
+        -- disconnect runtime watcher
+        if fpsOriginals.descConn then
+            fpsOriginals.descConn:Disconnect()
+            fpsOriginals.descConn = nil
+        end
+
+        -- restore render quality
+        pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Automatic end)
+
+        -- restore lighting
+        if fpsOriginals.shadows    ~= nil then ls.GlobalShadows  = fpsOriginals.shadows    end
+        if fpsOriginals.fogEnd     ~= nil then ls.FogEnd         = fpsOriginals.fogEnd     end
+        if fpsOriginals.fogStart   ~= nil then ls.FogStart       = fpsOriginals.fogStart   end
+        if fpsOriginals.brightness ~= nil then ls.Brightness     = fpsOriginals.brightness end
+        if fpsOriginals.ambient    ~= nil then ls.Ambient        = fpsOriginals.ambient    end
+        if fpsOriginals.outAmbient ~= nil then ls.OutdoorAmbient = fpsOriginals.outAmbient end
+
+        -- restore lighting effects
+        for k, parent in pairs(fpsOriginals) do
+            if typeof(k) == "Instance" then
+                pcall(function() k.Parent = parent end)
+                fpsOriginals[k] = nil
+            end
+        end
+
+        -- re-enable beams/trails/particles
+        for _, v in ipairs(workspace:GetDescendants()) do
+            if v:IsA("Beam") or v:IsA("Trail") or v:IsA("ParticleEmitter") or v:IsA("Smoke") or v:IsA("Fire") or v:IsA("Sparkles") then
+                pcall(function() v.Enabled = true end)
+            end
+        end
+
+        fpsOriginals = {}
+    end
+end
+
+-- ============================================================
+-- STREAMER MODE
+-- ============================================================
+local streamerActive = false
+
+-- NOTE: applyStreamerMode is called both early (from toggle UI) and late (from F5 keybind)
+-- GUI closing is handled via closeMenuForStreamer() which is defined after win exists
+local closeMenuForStreamer = nil  -- forward reference, assigned after GUI is built
+
+local function applyStreamerMode(on)
+    streamerActive   = on
+    CFG.StreamerMode = on
+    if on then
+        if closeMenuForStreamer then closeMenuForStreamer() end
+        -- hide all hitbox visuals so nothing is visible on stream
+        titleL.Text = "Combat Tool"
+        subL.Text   = "Private Client"
+    else
+        titleL.Text = "TriggerBot"
+        subL.Text   = "11phhsware  |  v3.0"
+    end
+end
+
+-- ============================================================
+-- THEME
+-- ============================================================
+local ACCENT = Color3.fromRGB(90, 190, 255)
+local ADIM   = Color3.fromRGB(38, 88, 138)
+local PANEL  = Color3.fromRGB(16, 19, 30)
+local CARD   = Color3.fromRGB(22, 26, 40)
+local CARD2  = Color3.fromRGB(28, 33, 50)
+local BORDER = Color3.fromRGB(40, 48, 68)
+local RED    = Color3.fromRGB(255, 80, 80)
+local GREEN  = Color3.fromRGB(55, 215, 125)
+local YELLOW = Color3.fromRGB(255, 200, 50)
+local WHITE  = Color3.fromRGB(225, 232, 248)
+local GREY   = Color3.fromRGB(100, 110, 140)
+local DIM    = Color3.fromRGB(50, 58, 80)
+
+local function tw(obj, props, t)
+    TweenService:Create(obj, t or TweenInfo.new(0.15, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), props):Play()
+end
+local MED = TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+
+-- ============================================================
+-- SCREENGUI + WINDOW
+-- ============================================================
+local sg = Instance.new("ScreenGui")
+sg.Name           = "HB_TriggerBot"
+sg.ResetOnSpawn   = false
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.DisplayOrder   = 9999
+sg.IgnoreGuiInset = true
+
+-- Try CoreGui first (works on most executors), fall back to PlayerGui
+local guiParented = false
+pcall(function()
+    sg.Parent = game:GetService("CoreGui")
+    guiParented = true
+end)
+if not guiParented then
+    sg.Parent = PlayerGui
+end
+
+local W, H = 340, 470
+local win = Instance.new("Frame", sg)
+win.Name             = "Window"
+win.Size             = UDim2.new(0, W, 0, H)
+win.Position         = UDim2.new(0.5, -W/2, 0.5, -H/2)
+win.BackgroundColor3 = PANEL
+win.BorderSizePixel  = 0
+win.ClipsDescendants = true
+Instance.new("UICorner", win).CornerRadius = UDim.new(0, 10)
+local wStroke = Instance.new("UIStroke", win)
+wStroke.Color     = BORDER
+wStroke.Thickness = 1
+wStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+local wGrad = Instance.new("UIGradient", win)
+wGrad.Color    = ColorSequence.new(Color3.fromRGB(20,24,38), Color3.fromRGB(11,13,20))
+wGrad.Rotation = 115
+
+-- top color bar
+local bar = Instance.new("Frame", win)
+bar.Size             = UDim2.new(1, 0, 0, 3)
+bar.BackgroundColor3 = ACCENT
+bar.BorderSizePixel  = 0
+local bGrad = Instance.new("UIGradient", bar)
+bGrad.Color    = ColorSequence.new(ACCENT, Color3.fromRGB(48,108,188))
+bGrad.Rotation = 0
+
+-- ============================================================
+-- HEADER (drag handle only)
+-- ============================================================
+local HDR_H = 58
+local hdr = Instance.new("Frame", win)
+hdr.Name             = "Header"
+hdr.Size             = UDim2.new(1, 0, 0, HDR_H)
+hdr.Position         = UDim2.new(0, 0, 0, 3)
+hdr.BackgroundColor3 = Color3.fromRGB(14, 17, 27)
+hdr.BorderSizePixel  = 0
+-- subtle bottom border
+local hdrLine = Instance.new("Frame", hdr)
+hdrLine.Size             = UDim2.new(1, -20, 0, 1)
+hdrLine.Position         = UDim2.new(0, 10, 1, -1)
+hdrLine.BackgroundColor3 = BORDER
+hdrLine.BorderSizePixel  = 0
+
+-- drag only from header
+local dragActive, dragStart, winStart = false, nil, nil
+hdr.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragActive = true
+        dragStart  = i.Position
+        winStart   = win.Position
+    end
+end)
+hdr.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragActive = false
+    end
+end)
+UserInputService.InputChanged:Connect(function(i)
+    if dragActive and i.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = i.Position - dragStart
+        win.Position = UDim2.new(
+            winStart.X.Scale, winStart.X.Offset + delta.X,
+            winStart.Y.Scale, winStart.Y.Offset + delta.Y
+        )
+    end
+end)
+
+-- icon
+local iconBg = Instance.new("Frame", hdr)
+iconBg.Size             = UDim2.new(0, 34, 0, 34)
+iconBg.Position         = UDim2.new(0, 12, 0.5, -17)
+iconBg.BackgroundColor3 = ADIM
+iconBg.BorderSizePixel  = 0
+Instance.new("UICorner", iconBg).CornerRadius = UDim.new(0, 8)
+local iconTxt = Instance.new("TextLabel", iconBg)
+iconTxt.Size               = UDim2.new(1, 0, 1, 0)
+iconTxt.BackgroundTransparency = 1
+iconTxt.Text               = "TB"
+iconTxt.TextColor3         = ACCENT
+iconTxt.Font               = Enum.Font.GothamBold
+iconTxt.TextSize           = 12
+iconTxt.TextXAlignment     = Enum.TextXAlignment.Center
+
+-- title + sub
+local titleL = Instance.new("TextLabel", hdr)
+titleL.Size               = UDim2.new(0, 160, 0, 20)
+titleL.Position           = UDim2.new(0, 54, 0, 8)
+titleL.BackgroundTransparency = 1
+titleL.Text               = "TriggerBot"
+titleL.TextColor3         = WHITE
+titleL.Font               = Enum.Font.GothamBold
+titleL.TextSize           = 15
+titleL.TextXAlignment     = Enum.TextXAlignment.Left
+
+local subL = Instance.new("TextLabel", hdr)
+subL.Size               = UDim2.new(0, 220, 0, 15)
+subL.Position           = UDim2.new(0, 54, 0, 30)
+subL.BackgroundTransparency = 1
+subL.Text               = "11phhsware  |  v3.0"
+subL.TextColor3         = GREY
+subL.Font               = Enum.Font.GothamMedium
+subL.TextSize           = 10
+subL.TextXAlignment     = Enum.TextXAlignment.Left
+
+-- status badge
+local badgeBg = Instance.new("Frame", hdr)
+badgeBg.Size             = UDim2.new(0, 82, 0, 24)
+badgeBg.Position         = UDim2.new(1, -122, 0.5, -12)
+badgeBg.BackgroundColor3 = Color3.fromRGB(40, 18, 18)
+badgeBg.BorderSizePixel  = 0
+Instance.new("UICorner", badgeBg).CornerRadius = UDim.new(0, 6)
+local bStroke = Instance.new("UIStroke", badgeBg)
+bStroke.Color = RED; bStroke.Thickness = 1
+bStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+local badgeDot = Instance.new("Frame", badgeBg)
+badgeDot.Size             = UDim2.new(0, 7, 0, 7)
+badgeDot.Position         = UDim2.new(0, 9, 0.5, -3)
+badgeDot.BackgroundColor3 = RED
+badgeDot.BorderSizePixel  = 0
+Instance.new("UICorner", badgeDot).CornerRadius = UDim.new(1, 0)
+
+local badgeTxt = Instance.new("TextLabel", badgeBg)
+badgeTxt.Size               = UDim2.new(1, -24, 1, 0)
+badgeTxt.Position           = UDim2.new(0, 22, 0, 0)
+badgeTxt.BackgroundTransparency = 1
+badgeTxt.Text               = "INACTIVE"
+badgeTxt.TextColor3         = RED
+badgeTxt.Font               = Enum.Font.GothamBold
+badgeTxt.TextSize           = 10
+badgeTxt.TextXAlignment     = Enum.TextXAlignment.Left
+
+local pulseTw = TweenService:Create(badgeDot,
+    TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+    {BackgroundTransparency = 0.75})
+
+local function setBadge(on)
+    if on then
+        tw(badgeBg,  {BackgroundColor3 = Color3.fromRGB(18,38,26)})
+        tw(badgeDot, {BackgroundColor3 = GREEN})
+        tw(badgeTxt, {TextColor3 = GREEN})
+        badgeTxt.Text = "ACTIVE"; pulseTw:Play()
+    else
+        pulseTw:Cancel()
+        tw(badgeBg,  {BackgroundColor3 = Color3.fromRGB(40,18,18)})
+        tw(badgeDot, {BackgroundColor3 = RED})
+        tw(badgeTxt, {TextColor3 = RED})
+        badgeTxt.Text = "INACTIVE"
+    end
+end
+
+-- close button
+local xBtn = Instance.new("TextButton", hdr)
+xBtn.Size             = UDim2.new(0, 28, 0, 28)
+xBtn.Position         = UDim2.new(1, -36, 0.5, -14)
+xBtn.BackgroundColor3 = Color3.fromRGB(55, 18, 18)
+xBtn.BackgroundTransparency = 0.3
+xBtn.Text             = "X"
+xBtn.TextColor3       = RED
+xBtn.TextSize         = 12
+xBtn.Font             = Enum.Font.GothamBold
+xBtn.BorderSizePixel  = 0
+Instance.new("UICorner", xBtn).CornerRadius = UDim.new(0, 6)
+local xStroke = Instance.new("UIStroke", xBtn)
+xStroke.Color = RED; xStroke.Thickness = 1
+xStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+local guiVisible = true
+local function toggleGui()
+    if win.Visible then
+        win.Visible = false
+    else
+        win.BackgroundTransparency = 0
+        win.Size = UDim2.new(0, W, 0, H)
+        win.Visible = true
+    end
+end
+
+-- Now that win and guiVisible exist, assign the forward ref used by applyStreamerMode
+closeMenuForStreamer = function()
+    if guiVisible then
+        guiVisible  = false
+        win.Visible = false
+    end
+end
+
+-- If streamer mode was toggled before the GUI finished building, apply it now
+if CFG.StreamerMode then
+    closeMenuForStreamer()
+end
+
+xBtn.MouseButton1Click:Connect(function() toggleGui() end)
+xBtn.MouseEnter:Connect(function() tw(xBtn, {BackgroundColor3 = Color3.fromRGB(100,20,20), BackgroundTransparency=0}) end)
+xBtn.MouseLeave:Connect(function() tw(xBtn, {BackgroundColor3 = Color3.fromRGB(55,18,18), BackgroundTransparency=0.3}) end)
+
+-- ============================================================
+-- TABS
+-- ============================================================
+local TAB_Y = HDR_H + 3
+local tabBar = Instance.new("Frame", win)
+tabBar.Size             = UDim2.new(1, 0, 0, 36)
+tabBar.Position         = UDim2.new(0, 0, 0, TAB_Y)
+tabBar.BackgroundColor3 = Color3.fromRGB(14, 17, 27)
+tabBar.BorderSizePixel  = 0
+
+local TABS  = {"Combat", "Settings", "Info"}
+local tBtns = {}
+local tPages= {}
+local TW    = math.floor(W / #TABS)
+
+for i, name in ipairs(TABS) do
+    local b = Instance.new("TextButton", tabBar)
+    b.Size             = UDim2.new(0, TW, 1, 0)
+    b.Position         = UDim2.new(0, (i-1)*TW, 0, 0)
+    b.BackgroundTransparency = 1
+    b.Text             = name
+    b.TextColor3       = i==1 and ACCENT or GREY
+    b.Font             = Enum.Font.GothamMedium
+    b.TextSize         = 12
+    b.BorderSizePixel  = 0
+    local ul = Instance.new("Frame", b)
+    ul.Size             = UDim2.new(0.6, 0, 0, 2)
+    ul.Position         = UDim2.new(0.2, 0, 1, -2)
+    ul.BackgroundColor3 = i==1 and ACCENT or Color3.fromRGB(14,17,27)
+    ul.BorderSizePixel  = 0
+    Instance.new("UICorner", ul).CornerRadius = UDim.new(0, 1)
+    tBtns[i] = b
+end
+
+-- tab divider
+local tabLine = Instance.new("Frame", win)
+tabLine.Size             = UDim2.new(1, -20, 0, 1)
+tabLine.Position         = UDim2.new(0, 10, 0, TAB_Y + 36)
+tabLine.BackgroundColor3 = BORDER
+tabLine.BorderSizePixel  = 0
+
+local PY = TAB_Y + 37
+local PH = H - PY - 4
+
+local function mkPage()
+    local sf = Instance.new("ScrollingFrame", win)
+    sf.Size              = UDim2.new(1, 0, 0, PH)
+    sf.Position          = UDim2.new(0, 0, 0, PY)
+    sf.BackgroundTransparency = 1
+    sf.BorderSizePixel   = 0
+    sf.ScrollBarThickness = 3
+    sf.ScrollBarImageColor3 = ADIM
+    sf.CanvasSize        = UDim2.new(0,0,0,0)
+    sf.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    sf.Visible           = false
+    local pad = Instance.new("UIPadding", sf)
+    pad.PaddingLeft   = UDim.new(0,10)
+    pad.PaddingRight  = UDim.new(0,10)
+    pad.PaddingTop    = UDim.new(0,8)
+    pad.PaddingBottom = UDim.new(0,8)
+    local list = Instance.new("UIListLayout", sf)
+    list.Padding            = UDim.new(0,6)
+    list.SortOrder          = Enum.SortOrder.LayoutOrder
+    list.FillDirection      = Enum.FillDirection.Vertical
+    list.HorizontalAlignment= Enum.HorizontalAlignment.Center
+    return sf
+end
+
+for i = 1, #TABS do tPages[i] = mkPage() end
+tPages[1].Visible = true
+
+local function switchTab(idx)
+    for i, b in ipairs(tBtns) do
+        local a = i == idx
+        tw(b, {TextColor3 = a and ACCENT or GREY})
+        local ul = b:FindFirstChildOfClass("Frame")
+        if ul then tw(ul, {BackgroundColor3 = a and ACCENT or Color3.fromRGB(14,17,27)}) end
+        tPages[i].Visible = a
+    end
+end
+for i, b in ipairs(tBtns) do
+    b.MouseButton1Click:Connect(function() switchTab(i) end)
+end
+
+-- ============================================================
+-- COMPONENT HELPERS
+-- ============================================================
+local function mkSec(page, txt, order)
+    local l = Instance.new("TextLabel", page)
+    l.Size               = UDim2.new(1, 0, 0, 16)
+    l.BackgroundTransparency = 1
+    l.Text               = txt
+    l.TextColor3         = DIM
+    l.Font               = Enum.Font.GothamBold
+    l.TextSize           = 9
+    l.TextXAlignment     = Enum.TextXAlignment.Left
+    l.LayoutOrder        = order
+    return l
+end
+
+local function mkToggle(page, text, default, onChange)
+    local row = Instance.new("Frame", page)
+    row.Size             = UDim2.new(1, 0, 0, 38)
+    row.BackgroundColor3 = CARD
+    row.BorderSizePixel  = 0
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+    local l = Instance.new("TextLabel", row)
+    l.Size               = UDim2.new(1, -56, 1, 0)
+    l.Position           = UDim2.new(0, 12, 0, 0)
+    l.BackgroundTransparency = 1
+    l.Text               = text
+    l.TextColor3         = WHITE
+    l.Font               = Enum.Font.GothamMedium
+    l.TextSize           = 12
+    l.TextXAlignment     = Enum.TextXAlignment.Left
+
+    local track = Instance.new("Frame", row)
+    track.Size             = UDim2.new(0, 38, 0, 20)
+    track.Position         = UDim2.new(1, -46, 0.5, -10)
+    track.BackgroundColor3 = default and ADIM or BORDER
+    track.BorderSizePixel  = 0
+    Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+    local ts = Instance.new("UIStroke", track)
+    ts.Color = BORDER; ts.Thickness = 1
+    ts.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+    local knob = Instance.new("Frame", track)
+    knob.Size             = UDim2.new(0, 16, 0, 16)
+    knob.Position         = UDim2.new(default and 1 or 0, default and -18 or 2, 0.5, -8)
+    knob.BackgroundColor3 = default and ACCENT or DIM
+    knob.BorderSizePixel  = 0
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    local val = default
+    local hit = Instance.new("TextButton", row)
+    hit.Size             = UDim2.new(1, 0, 1, 0)
+    hit.BackgroundTransparency = 1
+    hit.Text             = ""
+    hit.BorderSizePixel  = 0
+    hit.MouseButton1Click:Connect(function()
+        val = not val
+        tw(track, {BackgroundColor3 = val and ADIM or BORDER})
+        tw(knob,  {BackgroundColor3 = val and ACCENT or DIM,
+                   Position = UDim2.new(val and 1 or 0, val and -18 or 2, 0.5, -8)})
+        if onChange then onChange(val) end
+    end)
+    hit.MouseEnter:Connect(function() tw(row, {BackgroundColor3 = CARD2}) end)
+    hit.MouseLeave:Connect(function() tw(row, {BackgroundColor3 = CARD}) end)
+
+    local function sync(v)
+        val = v
+        tw(track, {BackgroundColor3 = v and ADIM or BORDER})
+        tw(knob,  {BackgroundColor3 = v and ACCENT or DIM,
+                   Position = UDim2.new(v and 1 or 0, v and -18 or 2, 0.5, -8)})
+    end
+    return row, sync
+end
+
+local function mkSlider(page, text, mn, mx, init, suf, onChange)
+    local row = Instance.new("Frame", page)
+    row.Size             = UDim2.new(1, 0, 0, 54)
+    row.BackgroundColor3 = CARD
+    row.BorderSizePixel  = 0
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+    local nl = Instance.new("TextLabel", row)
+    nl.Size               = UDim2.new(0.6, 0, 0, 18)
+    nl.Position           = UDim2.new(0, 12, 0, 7)
+    nl.BackgroundTransparency = 1
+    nl.Text               = text
+    nl.TextColor3         = WHITE
+    nl.Font               = Enum.Font.GothamMedium
+    nl.TextSize           = 12
+    nl.TextXAlignment     = Enum.TextXAlignment.Left
+
+    local vl = Instance.new("TextLabel", row)
+    vl.Size               = UDim2.new(0.35, 0, 0, 18)
+    vl.Position           = UDim2.new(0.63, -6, 0, 7)
+    vl.BackgroundTransparency = 1
+    vl.Text               = tostring(init)..(suf or "")
+    vl.TextColor3         = ACCENT
+    vl.Font               = Enum.Font.RobotoMono
+    vl.TextSize           = 11
+    vl.TextXAlignment     = Enum.TextXAlignment.Right
+
+    local bg = Instance.new("Frame", row)
+    bg.Size             = UDim2.new(1, -24, 0, 4)
+    bg.Position         = UDim2.new(0, 12, 1, -14)
+    bg.BackgroundColor3 = BORDER
+    bg.BorderSizePixel  = 0
+    Instance.new("UICorner", bg).CornerRadius = UDim.new(0, 2)
+
+    local pct  = (init - mn) / (mx - mn)
+    local fill = Instance.new("Frame", bg)
+    fill.Size             = UDim2.new(pct, 0, 1, 0)
+    fill.BackgroundColor3 = ADIM
+    fill.BorderSizePixel  = 0
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(0, 2)
+    local fg = Instance.new("UIGradient", fill)
+    fg.Color    = ColorSequence.new(ADIM, ACCENT)
+    fg.Rotation = 0
+
+    local thumb = Instance.new("Frame", bg)
+    thumb.Size             = UDim2.new(0, 14, 0, 14)
+    thumb.Position         = UDim2.new(pct, -7, 0.5, -7)
+    thumb.BackgroundColor3 = ACCENT
+    thumb.BorderSizePixel  = 0
+    Instance.new("UICorner", thumb).CornerRadius = UDim.new(1, 0)
+    local tStroke = Instance.new("UIStroke", thumb)
+    tStroke.Color = Color3.fromRGB(11,13,20); tStroke.Thickness = 2
+    tStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+    local dragging = false
+    local function upd(ax)
+        local w = bg.AbsoluteSize.X
+        local x = bg.AbsolutePosition.X
+        local t = math.clamp((ax - x) / w, 0, 1)
+        local v = math.floor(mn + t*(mx-mn) + 0.5)
+        t = (v - mn) / (mx - mn)
+        tw(fill,  {Size     = UDim2.new(t, 0, 1, 0)})
+        tw(thumb, {Position = UDim2.new(t, -7, 0.5, -7)})
+        vl.Text = tostring(v)..(suf or "")
+        if onChange then onChange(v) end
+    end
+
+    local ib = Instance.new("TextButton", bg)
+    ib.Size             = UDim2.new(1, 0, 1, 18)
+    ib.Position         = UDim2.new(0, 0, 0, -7)
+    ib.BackgroundTransparency = 1
+    ib.Text             = ""
+    ib.BorderSizePixel  = 0
+    ib.MouseButton1Down:Connect(function(x) dragging = true; upd(x) end)
+    UserInputService.InputChanged:Connect(function(i)
+        if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then upd(i.Position.X) end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+    end)
+    row.MouseEnter:Connect(function() tw(row, {BackgroundColor3 = CARD2}) end)
+    row.MouseLeave:Connect(function() tw(row, {BackgroundColor3 = CARD}) end)
+    return row
+end
+
+local function mkKeybind(page, text, default, onChange, order)
+    local row = Instance.new("Frame", page)
+    row.Size             = UDim2.new(1, 0, 0, 44)
+    row.BackgroundColor3 = CARD
+    row.BorderSizePixel  = 0
+    row.LayoutOrder      = order
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+    local l = Instance.new("TextLabel", row)
+    l.Size               = UDim2.new(0.55, 0, 1, 0)
+    l.Position           = UDim2.new(0, 12, 0, 0)
+    l.BackgroundTransparency = 1
+    l.Text               = text
+    l.TextColor3         = WHITE
+    l.Font               = Enum.Font.GothamMedium
+    l.TextSize           = 12
+    l.TextXAlignment     = Enum.TextXAlignment.Left
+
+    local btn = Instance.new("TextButton", row)
+    btn.Size             = UDim2.new(0, 110, 0, 28)
+    btn.Position         = UDim2.new(1, -118, 0.5, -14)
+    btn.BackgroundColor3 = ADIM
+    btn.Text             = tostring(default):gsub("Enum%.KeyCode%.", "")
+    btn.TextColor3       = ACCENT
+    btn.Font             = Enum.Font.RobotoMono
+    btn.TextSize         = 11
+    btn.BorderSizePixel  = 0
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    local ks = Instance.new("UIStroke", btn)
+    ks.Color = ADIM; ks.Thickness = 1
+    ks.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+    local waiting = false
+    btn.MouseButton1Click:Connect(function()
+        if waiting then return end
+        waiting = true
+        btn.Text      = "Press key..."
+        btn.TextColor3= GREY
+        tw(btn, {BackgroundColor3 = CARD})
+        local conn
+        conn = UserInputService.InputBegan:Connect(function(i, gp)
+            if gp or i.UserInputType ~= Enum.UserInputType.Keyboard then return end
+            btn.Text       = tostring(i.KeyCode):gsub("Enum%.KeyCode%.", "")
+            btn.TextColor3 = ACCENT
+            tw(btn, {BackgroundColor3 = ADIM})
+            waiting = false
+            if onChange then onChange(i.KeyCode) end
+            conn:Disconnect()
+        end)
+    end)
+    btn.MouseEnter:Connect(function() if not waiting then tw(btn, {BackgroundColor3 = Color3.fromRGB(48,108,165)}) end end)
+    btn.MouseLeave:Connect(function() if not waiting then tw(btn, {BackgroundColor3 = ADIM}) end end)
+    row.MouseEnter:Connect(function() tw(row, {BackgroundColor3 = CARD2}) end)
+    row.MouseLeave:Connect(function() tw(row, {BackgroundColor3 = CARD}) end)
+    return row
+end
+
+-- ============================================================
+-- PAGE 1: COMBAT
+-- ============================================================
+local p1 = tPages[1]
+
+mkSec(p1, "DETECTION", 1)
+
+local rowEnabled, syncEnabled = mkToggle(p1, "Enable TriggerBot", CFG.Enabled, function(v)
+    CFG.Enabled = v; setBadge(v)
+end)
+rowEnabled.LayoutOrder = 2
+
+local rowTeam = mkToggle(p1, "Team Check", CFG.TeamCheck, function(v) CFG.TeamCheck = v end)
+rowTeam.LayoutOrder = 3
+
+local rowKnock = mkToggle(p1, "Knock Check (skip downed)", CFG.KnockCheck, function(v) CFG.KnockCheck = v end)
+rowKnock.LayoutOrder = 4
+
+local rowKnife = mkToggle(p1, "Knife Block (disable while knife out)", CFG.KnifeCheck, function(v) CFG.KnifeCheck = v end)
+rowKnife.LayoutOrder = 5
+
+mkSec(p1, "PARAMETERS", 6).LayoutOrder = 6
+
+local sd = mkSlider(p1, "Fire Delay", 0, 300, math.floor(CFG.Delay*1000), " ms",
+    function(v) CFG.Delay = v/1000 end)
+sd.LayoutOrder = 7
+
+-- Max distance slider now goes up to 9999
+local sm = mkSlider(p1, "Max Distance", 100, 9999, CFG.MaxDistance, " st",
+    function(v) CFG.MaxDistance = v end)
+sm.LayoutOrder = 8
+
+mkSec(p1, "PREDICTION", 9).LayoutOrder = 9
+
+local sp2 = mkSlider(p1, "Predict Strength", 0, 200, math.floor(CFG.PredictStrength * 100), "%",
+    function(v) CFG.PredictStrength = v / 100 end)
+sp2.LayoutOrder = 10
+
+-- ============================================================
+-- PAGE 2: SETTINGS
+-- ============================================================
+local p2 = tPages[2]
+
+mkSec(p2, "ACTIVATION MODE", 1)
+
+-- Toggle / Hold row
+local modeRow = Instance.new("Frame", p2)
+modeRow.Size             = UDim2.new(1, 0, 0, 44)
+modeRow.BackgroundColor3 = CARD
+modeRow.BorderSizePixel  = 0
+modeRow.LayoutOrder      = 2
+Instance.new("UICorner", modeRow).CornerRadius = UDim.new(0, 6)
+
+local modeLbl = Instance.new("TextLabel", modeRow)
+modeLbl.Size               = UDim2.new(0.5, 0, 1, 0)
+modeLbl.Position           = UDim2.new(0, 12, 0, 0)
+modeLbl.BackgroundTransparency = 1
+modeLbl.Text               = "Mode"
+modeLbl.TextColor3         = WHITE
+modeLbl.Font               = Enum.Font.GothamMedium
+modeLbl.TextSize           = 12
+modeLbl.TextXAlignment     = Enum.TextXAlignment.Left
+
+local modeBtn = Instance.new("TextButton", modeRow)
+modeBtn.Size             = UDim2.new(0, 100, 0, 28)
+modeBtn.Position         = UDim2.new(1, -108, 0.5, -14)
+modeBtn.BackgroundColor3 = ADIM
+modeBtn.Text             = "TOGGLE"
+modeBtn.TextColor3       = ACCENT
+modeBtn.Font             = Enum.Font.GothamBold
+modeBtn.TextSize         = 11
+modeBtn.BorderSizePixel  = 0
+Instance.new("UICorner", modeBtn).CornerRadius = UDim.new(0, 6)
+local mStroke = Instance.new("UIStroke", modeBtn)
+mStroke.Color = ADIM; mStroke.Thickness = 1
+mStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+modeBtn.MouseButton1Click:Connect(function()
+    CFG.HoldMode = not CFG.HoldMode
+    if CFG.HoldMode then
+        modeBtn.Text      = "HOLD"
+        modeBtn.TextColor3= YELLOW
+        tw(modeBtn, {BackgroundColor3 = Color3.fromRGB(80, 58, 10)})
+    else
+        modeBtn.Text      = "TOGGLE"
+        modeBtn.TextColor3= ACCENT
+        tw(modeBtn, {BackgroundColor3 = ADIM})
+    end
+end)
+modeBtn.MouseEnter:Connect(function() tw(modeBtn, {BackgroundColor3 = Color3.fromRGB(50,110,170)}) end)
+modeBtn.MouseLeave:Connect(function()
+    tw(modeBtn, {BackgroundColor3 = CFG.HoldMode and Color3.fromRGB(80,58,10) or ADIM})
+end)
+modeRow.MouseEnter:Connect(function() tw(modeRow, {BackgroundColor3 = CARD2}) end)
+modeRow.MouseLeave:Connect(function() tw(modeRow, {BackgroundColor3 = CARD}) end)
+
+mkSec(p2, "KEYBINDS", 3).LayoutOrder = 3
+
+mkKeybind(p2, "Toggle Key (Toggle mode)", CFG.ActivationKey,
+    function(k) CFG.ActivationKey = k end, 4)
+
+mkKeybind(p2, "Hold Key (Hold mode)", CFG.HoldKey,
+    function(k) CFG.HoldKey = k end, 5)
+
+mkKeybind(p2, "Show/Hide Menu", CFG.MenuKey,
+    function(k) CFG.MenuKey = k end, 6)
+
+mkSec(p2, "AIM BODY PART", 7).LayoutOrder = 7
+
+-- ANY body part option shown clearly
+local AIMS   = {"ANY", "HumanoidRootPart", "Head", "Torso", "UpperTorso", "LowerTorso"}
+local aimIdx = 1
+
+local aimRow = Instance.new("Frame", p2)
+aimRow.Size             = UDim2.new(1, 0, 0, 44)
+aimRow.BackgroundColor3 = CARD
+aimRow.BorderSizePixel  = 0
+aimRow.LayoutOrder      = 8
+Instance.new("UICorner", aimRow).CornerRadius = UDim.new(0, 6)
+
+local aimLbl = Instance.new("TextLabel", aimRow)
+aimLbl.Size               = UDim2.new(0.45, 0, 1, 0)
+aimLbl.Position           = UDim2.new(0, 12, 0, 0)
+aimLbl.BackgroundTransparency = 1
+aimLbl.Text               = "Aim Part"
+aimLbl.TextColor3         = WHITE
+aimLbl.Font               = Enum.Font.GothamMedium
+aimLbl.TextSize           = 12
+aimLbl.TextXAlignment     = Enum.TextXAlignment.Left
+
+-- left arrow
+local aimLeft = Instance.new("TextButton", aimRow)
+aimLeft.Size             = UDim2.new(0, 24, 0, 28)
+aimLeft.Position         = UDim2.new(1, -150, 0.5, -14)
+aimLeft.BackgroundColor3 = DIM
+aimLeft.Text             = "<"
+aimLeft.TextColor3       = WHITE
+aimLeft.Font             = Enum.Font.GothamBold
+aimLeft.TextSize         = 13
+aimLeft.BorderSizePixel  = 0
+Instance.new("UICorner", aimLeft).CornerRadius = UDim.new(0, 5)
+
+local aimVal = Instance.new("TextLabel", aimRow)
+aimVal.Size               = UDim2.new(0, 94, 0, 28)
+aimVal.Position           = UDim2.new(1, -124, 0.5, -14)
+aimVal.BackgroundColor3   = Color3.fromRGB(11, 13, 22)
+aimVal.Text               = AIMS[aimIdx]
+aimVal.TextColor3         = ACCENT
+aimVal.Font               = Enum.Font.RobotoMono
+aimVal.TextSize           = 10
+aimVal.TextXAlignment     = Enum.TextXAlignment.Center
+aimVal.BorderSizePixel    = 0
+Instance.new("UICorner", aimVal).CornerRadius = UDim.new(0, 5)
+
+local aimRight = Instance.new("TextButton", aimRow)
+aimRight.Size             = UDim2.new(0, 24, 0, 28)
+aimRight.Position         = UDim2.new(1, -28, 0.5, -14)
+aimRight.BackgroundColor3 = DIM
+aimRight.Text             = ">"
+aimRight.TextColor3       = WHITE
+aimRight.Font             = Enum.Font.GothamBold
+aimRight.TextSize         = 13
+aimRight.BorderSizePixel  = 0
+Instance.new("UICorner", aimRight).CornerRadius = UDim.new(0, 5)
+
+local function updateAim(dir)
+    aimIdx = ((aimIdx - 1 + dir) % #AIMS) + 1
+    CFG.AimPart = AIMS[aimIdx]
+    aimVal.Text = AIMS[aimIdx]
+    tw(aimVal, {TextColor3 = WHITE})
+    task.delay(0.1, function() tw(aimVal, {TextColor3 = ACCENT}) end)
+end
+aimLeft.MouseButton1Click:Connect(function()  updateAim(-1) end)
+aimRight.MouseButton1Click:Connect(function() updateAim(1)  end)
+aimLeft.MouseEnter:Connect(function()  tw(aimLeft,  {BackgroundColor3 = ADIM}) end)
+aimLeft.MouseLeave:Connect(function()  tw(aimLeft,  {BackgroundColor3 = DIM})  end)
+aimRight.MouseEnter:Connect(function() tw(aimRight, {BackgroundColor3 = ADIM}) end)
+aimRight.MouseLeave:Connect(function() tw(aimRight, {BackgroundColor3 = DIM})  end)
+aimRow.MouseEnter:Connect(function() tw(aimRow, {BackgroundColor3 = CARD2}) end)
+aimRow.MouseLeave:Connect(function() tw(aimRow, {BackgroundColor3 = CARD})  end)
+
+mkSec(p2, "PERFORMANCE & PRIVACY", 9).LayoutOrder = 9
+
+local rowFps = mkToggle(p2, "FPS Booster (low-end PC)", CFG.FpsBoost, function(v)
+    CFG.FpsBoost = v
+    applyFpsBoost(v)
+end)
+rowFps.LayoutOrder = 10
+
+local rowStreamer = mkToggle(p2, "Streamer Mode  [F5]", CFG.StreamerMode, function(v)
+    CFG.StreamerMode = v
+    applyStreamerMode(v)
+end)
+rowStreamer.LayoutOrder = 11
+
+local streamerSync  -- forward declare so keybind can call it
+streamerSync = function(v)
+    CFG.StreamerMode = v
+    applyStreamerMode(v)
+    -- sync the toggle UI
+    local hit = rowStreamer:FindFirstChildOfClass("TextButton")
+    if hit then hit.MouseButton1Click:Fire() end
+end
+
+-- AimViewer button — forward ref, avFrame assigned later
+local returnToAimViewer = nil  -- filled in after avFrame is built
+
+local avBtnRow = Instance.new("Frame", p2)
+avBtnRow.Size             = UDim2.new(1, 0, 0, 44)
+avBtnRow.BackgroundColor3 = Color3.fromRGB(22, 26, 40)
+avBtnRow.BorderSizePixel  = 0
+avBtnRow.LayoutOrder      = 12
+Instance.new("UICorner", avBtnRow).CornerRadius = UDim.new(0, 6)
+local avBtnStroke = Instance.new("UIStroke", avBtnRow)
+avBtnStroke.Color     = Color3.fromRGB(30, 60, 130)
+avBtnStroke.Thickness = 1
+avBtnStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+local avBtnLbl = Instance.new("TextLabel", avBtnRow)
+avBtnLbl.Size               = UDim2.new(0.55, 0, 1, 0)
+avBtnLbl.Position           = UDim2.new(0, 12, 0, 0)
+avBtnLbl.BackgroundTransparency = 1
+avBtnLbl.Text               = "AimViewer"
+avBtnLbl.TextColor3         = Color3.fromRGB(225, 232, 248)
+avBtnLbl.Font               = Enum.Font.GothamMedium
+avBtnLbl.TextSize            = 12
+avBtnLbl.TextXAlignment     = Enum.TextXAlignment.Left
+
+local avBtn = Instance.new("TextButton", avBtnRow)
+avBtn.Size             = UDim2.new(0, 100, 0, 28)
+avBtn.Position         = UDim2.new(1, -108, 0.5, -14)
+avBtn.BackgroundColor3 = Color3.fromRGB(30, 60, 130)
+avBtn.Text             = "SHOW"
+avBtn.TextColor3       = Color3.fromRGB(100, 170, 255)
+avBtn.Font             = Enum.Font.GothamBold
+avBtn.TextSize         = 11
+avBtn.BorderSizePixel  = 0
+Instance.new("UICorner", avBtn).CornerRadius = UDim.new(0, 6)
+local avBtnS = Instance.new("UIStroke", avBtn)
+avBtnS.Color = Color3.fromRGB(40, 80, 170); avBtnS.Thickness = 1
+avBtnS.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+avBtn.MouseButton1Click:Connect(function()
+    if returnToAimViewer then returnToAimViewer() end
+end)
+avBtn.MouseEnter:Connect(function()
+    TweenService:Create(avBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(50, 90, 180)}):Play()
+end)
+avBtn.MouseLeave:Connect(function()
+    TweenService:Create(avBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(30, 60, 130)}):Play()
+end)
+avBtnRow.MouseEnter:Connect(function()
+    TweenService:Create(avBtnRow, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(28, 33, 50)}):Play()
+end)
+avBtnRow.MouseLeave:Connect(function()
+    TweenService:Create(avBtnRow, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(22, 26, 40)}):Play()
+end)
+
+-- ============================================================
+-- PAGE 3: INFO
+-- ============================================================
+local p3 = tPages[3]
+mkSec(p3, "SYSTEM INFO", 1)
+
+local infos = {
+    {"Version",   "3.0.0"},
+    {"Game",      "Da Hills"},
+    {"Detection", "Raycast + Mouse"},
+    {"Aim",       "ANY body part"},
+    {"Distance",  "Up to 9999 st"},
+    {"Hitbox",    "Sphere expand"},
+    {"Modes",     "Toggle / Hold"},
+    {"Menu Key",  "RightCtrl (rebind)"},
+}
+for i, pair in ipairs(infos) do
+    local row = Instance.new("Frame", p3)
+    row.Size             = UDim2.new(1, 0, 0, 32)
+    row.BackgroundColor3 = i%2==0 and CARD or Color3.fromRGB(19,22,34)
+    row.BorderSizePixel  = 0
+    row.LayoutOrder      = i+1
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 5)
+    local k = Instance.new("TextLabel", row)
+    k.Size               = UDim2.new(0.5, 0, 1, 0)
+    k.Position           = UDim2.new(0, 12, 0, 0)
+    k.BackgroundTransparency = 1
+    k.Text               = pair[1]
+    k.TextColor3         = GREY
+    k.Font               = Enum.Font.GothamMedium
+    k.TextSize           = 11
+    k.TextXAlignment     = Enum.TextXAlignment.Left
+    local v = Instance.new("TextLabel", row)
+    v.Size               = UDim2.new(0.45, 0, 1, 0)
+    v.Position           = UDim2.new(0.52, -6, 0, 0)
+    v.BackgroundTransparency = 1
+    v.Text               = pair[2]
+    v.TextColor3         = WHITE
+    v.Font               = Enum.Font.RobotoMono
+    v.TextSize           = 10
+    v.TextXAlignment     = Enum.TextXAlignment.Right
+end
+
+-- ============================================================
+-- GLOBAL KEYBINDS
+-- ============================================================
+-- helper to sync the streamer toggle row knob visually
+local function syncStreamerToggle(v)
+    local track = rowStreamer:FindFirstChildOfClass("Frame")
+    if not track then return end
+    local knob = track:FindFirstChildOfClass("Frame")
+    tw(track, {BackgroundColor3 = v and ADIM or BORDER})
+    if knob then
+        tw(knob, {BackgroundColor3 = v and ACCENT or DIM,
+                   Position = UDim2.new(v and 1 or 0, v and -18 or 2, 0.5, -8)})
+    end
+end
+
+UserInputService.InputBegan:Connect(function(i, gp)
+    if gp then return end
+
+    -- F5: toggle streamer mode — menu key and RightCtrl completely blocked while active
+    if i.KeyCode == Enum.KeyCode.F5 then
+        CFG.StreamerMode = not CFG.StreamerMode
+        applyStreamerMode(CFG.StreamerMode)
+        syncStreamerToggle(CFG.StreamerMode)
+        return
+    end
+
+    -- Triggerbot keys always work regardless of streamer mode
+    if CFG.HoldMode then
+        if i.KeyCode == CFG.HoldKey then setBadge(true) end
+    else
+        if i.KeyCode == CFG.ActivationKey then
+            CFG.Enabled = not CFG.Enabled
+            setBadge(CFG.Enabled)
+            syncEnabled(CFG.Enabled)
+        end
+    end
+
+end)
+
+local LAYER = "aimviewer"   -- "aimviewer" | "triggerbot"
+
+-- Show/hide TriggerBot menu via keybind (no gp filter).
+UserInputService.InputBegan:Connect(function(i)
+    if i.KeyCode ~= CFG.MenuKey then return end
+    if CFG.StreamerMode then return end
+    if LAYER == "triggerbot" then
+        toggleGui()
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(i, gp)
+    if gp then return end
+    if CFG.HoldMode and i.KeyCode == CFG.HoldKey then
+        setBadge(false)
+    end
+end)
+
+-- ============================================================
+-- ============================================================
+-- AIMVIEWER + TRIGGERBOT LAYER SWITCHER
+-- AimViewer is a real spectator tool. Each layer fully destroys
+-- itself before the other is created, so nothing stacks.
+-- ============================================================
+
+-- ── Shared state ─────────────────────────────────────────────
+local avConn      = nil
+local avContainer = nil
+local spectating  = nil
+local avSegments  = nil           -- segment frames for 3D perspective line
+
+-- TriggerBot window starts hidden — AimViewer owns the screen first
+win.Visible = false
+win.Size    = UDim2.new(0, W, 0, H)
+win.BackgroundTransparency = 0
+
+-- ── Layer switch helpers ──────────────────────────────────────
+local function destroyAimViewer()
+    if avConn then avConn:Disconnect(); avConn = nil end
+    spectating = nil
+    -- restore camera
+    pcall(function() CAM.CameraType = Enum.CameraType.Custom end)
+    -- destroy overlay elements and reopen button
+    local rb = sg:FindFirstChild("AV_ReopenBtn")
+    if rb then rb:Destroy() end
+    local al = sg:FindFirstChild("AV_AimLine")
+    if al then al:Destroy() end
+    local sh = sg:FindFirstChild("AV_StopHud")
+    if sh then sh:Destroy() end
+    if avContainer and avContainer.Parent then
+        avContainer:Destroy()
+        avContainer = nil
+    end
+end
+
+local function destroyTriggerBot()
+    win.Visible = false
+end
+
+-- ── Build AimViewer ───────────────────────────────────────────
+local function buildAimViewer()
+    destroyAimViewer()
+    LAYER = "aimviewer"
+
+    local AV_W, AV_H = 420, 530
+    local av = Instance.new("Frame", sg)
+    av.Name             = "AimViewer"
+    av.Size             = UDim2.new(0, AV_W, 0, AV_H)
+    av.Position         = UDim2.new(0.5, -AV_W/2, 0.5, -AV_H/2)
+    av.BackgroundColor3 = Color3.fromRGB(10, 12, 20)
+    av.BorderSizePixel  = 0
+    av.ZIndex           = 100
+    av.ClipsDescendants = true
+    avContainer = av
+    Instance.new("UICorner", av).CornerRadius = UDim.new(0, 10)
+    local avStk = Instance.new("UIStroke", av)
+    avStk.Color = Color3.fromRGB(35, 42, 62); avStk.Thickness = 1
+    avStk.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+    -- top bar
+    local avBar = Instance.new("Frame", av)
+    avBar.Size = UDim2.new(1,0,0,3)
+    avBar.BackgroundColor3 = Color3.fromRGB(70,130,220)
+    avBar.BorderSizePixel = 0; avBar.ZIndex = 101
+    local avBarG = Instance.new("UIGradient", avBar)
+    avBarG.Color = ColorSequence.new(Color3.fromRGB(70,130,220), Color3.fromRGB(30,70,160))
+
+    -- header
+    local avHdr = Instance.new("Frame", av)
+    avHdr.Size = UDim2.new(1,0,0,56); avHdr.Position = UDim2.new(0,0,0,3)
+    avHdr.BackgroundColor3 = Color3.fromRGB(13,16,26)
+    avHdr.BorderSizePixel = 0; avHdr.ZIndex = 101
+
+    local avIcon = Instance.new("Frame", avHdr)
+    avIcon.Size = UDim2.new(0,34,0,34); avIcon.Position = UDim2.new(0,12,0.5,-17)
+    avIcon.BackgroundColor3 = Color3.fromRGB(30,60,130)
+    avIcon.BorderSizePixel = 0; avIcon.ZIndex = 102
+    Instance.new("UICorner", avIcon).CornerRadius = UDim.new(0,8)
+    local avIconTxt = Instance.new("TextLabel", avIcon)
+    avIconTxt.Size = UDim2.new(1,0,1,0); avIconTxt.BackgroundTransparency = 1
+    avIconTxt.Text = "AV"; avIconTxt.TextColor3 = Color3.fromRGB(100,170,255)
+    avIconTxt.Font = Enum.Font.GothamBold; avIconTxt.TextSize = 12; avIconTxt.ZIndex = 103
+
+    local avTitle = Instance.new("TextLabel", avHdr)
+    avTitle.Size = UDim2.new(0,200,0,20); avTitle.Position = UDim2.new(0,54,0,8)
+    avTitle.BackgroundTransparency = 1; avTitle.Text = "AimViewer"
+    avTitle.TextColor3 = Color3.fromRGB(225,232,248); avTitle.Font = Enum.Font.GothamBold
+    avTitle.TextSize = 15; avTitle.TextXAlignment = Enum.TextXAlignment.Left; avTitle.ZIndex = 102
+
+    local avSub = Instance.new("TextLabel", avHdr)
+    avSub.Size = UDim2.new(0,240,0,14); avSub.Position = UDim2.new(0,54,0,30)
+    avSub.BackgroundTransparency = 1; avSub.Text = "Player Aim Inspector  |  v1.2"
+    avSub.TextColor3 = Color3.fromRGB(90,100,130); avSub.Font = Enum.Font.GothamMedium
+    avSub.TextSize = 10; avSub.TextXAlignment = Enum.TextXAlignment.Left; avSub.ZIndex = 102
+
+    -- X button — just hides the AimViewer (MenuKey reopens it)
+    local avCloseBtn = Instance.new("TextButton", avHdr)
+    avCloseBtn.Size             = UDim2.new(0, 28, 0, 28)
+    avCloseBtn.Position         = UDim2.new(1, -36, 0.5, -14)
+    avCloseBtn.BackgroundColor3 = Color3.fromRGB(50, 16, 16)
+    avCloseBtn.BackgroundTransparency = 0.3
+    avCloseBtn.Text             = "X"
+    avCloseBtn.TextColor3       = Color3.fromRGB(255, 80, 80)
+    avCloseBtn.TextSize         = 12
+    avCloseBtn.Font             = Enum.Font.GothamBold
+    avCloseBtn.BorderSizePixel  = 0
+    avCloseBtn.ZIndex           = 103
+    Instance.new("UICorner", avCloseBtn).CornerRadius = UDim.new(0, 6)
+    -- Floating reopen button — parented to sg so it stays alive when av is hidden
+    local reopenBtn = Instance.new("TextButton", sg)
+    reopenBtn.Name             = "AV_ReopenBtn"
+    reopenBtn.Size             = UDim2.new(0, 110, 0, 30)
+    reopenBtn.Position         = UDim2.new(0, 8, 0, 8)
+    reopenBtn.BackgroundColor3 = Color3.fromRGB(20, 50, 120)
+    reopenBtn.Text             = "▶  AimViewer"
+    reopenBtn.TextColor3       = Color3.fromRGB(100, 170, 255)
+    reopenBtn.Font             = Enum.Font.GothamBold
+    reopenBtn.TextSize         = 11
+    reopenBtn.BorderSizePixel  = 0
+    reopenBtn.ZIndex           = 300
+    reopenBtn.Visible          = false  -- only shows after X is pressed
+    Instance.new("UICorner", reopenBtn).CornerRadius = UDim.new(0, 6)
+    local rkStroke = Instance.new("UIStroke", reopenBtn)
+    rkStroke.Color = Color3.fromRGB(50, 100, 200); rkStroke.Thickness = 1
+    rkStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+    reopenBtn.MouseButton1Click:Connect(function()
+        reopenBtn.Visible = false
+        av.Visible = true
+    end)
+    reopenBtn.MouseEnter:Connect(function()
+        TweenService:Create(reopenBtn, TweenInfo.new(0.12),
+            {BackgroundColor3 = Color3.fromRGB(40, 80, 180)}):Play()
+    end)
+    reopenBtn.MouseLeave:Connect(function()
+        TweenService:Create(reopenBtn, TweenInfo.new(0.12),
+            {BackgroundColor3 = Color3.fromRGB(20, 50, 120)}):Play()
+    end)
+
+    avCloseBtn.MouseButton1Click:Connect(function()
+        av.Visible = false
+        reopenBtn.Visible = true  -- show the reopen button
+    end)
+    avCloseBtn.MouseEnter:Connect(function()
+        TweenService:Create(avCloseBtn, TweenInfo.new(0.12),
+            {BackgroundColor3 = Color3.fromRGB(100,20,20), BackgroundTransparency=0}):Play()
+    end)
+    avCloseBtn.MouseLeave:Connect(function()
+        TweenService:Create(avCloseBtn, TweenInfo.new(0.12),
+            {BackgroundColor3 = Color3.fromRGB(50,16,16), BackgroundTransparency=0.3}):Play()
+    end)
+
+    -- Drag AimViewer by header
+    local avDragActive, avDragStart, avWinStart = false, nil, nil
+    avHdr.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+            avDragActive = true; avDragStart = i.Position; avWinStart = av.Position
+        end
+    end)
+    avHdr.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then avDragActive = false end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if avDragActive and i.UserInputType == Enum.UserInputType.MouseMovement then
+            local d = i.Position - avDragStart
+            av.Position = UDim2.new(avWinStart.X.Scale, avWinStart.X.Offset + d.X,
+                                     avWinStart.Y.Scale, avWinStart.Y.Offset + d.Y)
+        end
+    end)
+
+    -- search bar
+    local avSearchBg = Instance.new("Frame", av)
+    avSearchBg.Size = UDim2.new(1,-24,0,36); avSearchBg.Position = UDim2.new(0,12,0,68)
+    avSearchBg.BackgroundColor3 = Color3.fromRGB(18,22,36)
+    avSearchBg.BorderSizePixel = 0; avSearchBg.ZIndex = 101
+    Instance.new("UICorner", avSearchBg).CornerRadius = UDim.new(0,7)
+    local avSSk = Instance.new("UIStroke", avSearchBg)
+    avSSk.Color = Color3.fromRGB(40,50,75); avSSk.Thickness = 1
+    avSSk.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+    local avSIcon = Instance.new("TextLabel", avSearchBg)
+    avSIcon.Size = UDim2.new(0,28,1,0); avSIcon.BackgroundTransparency = 1
+    avSIcon.Text = "🔍"; avSIcon.TextSize = 13; avSIcon.ZIndex = 102
+
+    local avSearch = Instance.new("TextBox", avSearchBg)
+    avSearch.Size = UDim2.new(1,-32,1,0); avSearch.Position = UDim2.new(0,28,0,0)
+    avSearch.BackgroundTransparency = 1
+    avSearch.PlaceholderText = "Search players..."
+    avSearch.PlaceholderColor3 = Color3.fromRGB(60,70,100)
+    avSearch.Text = ""; avSearch.TextColor3 = Color3.fromRGB(200,210,230)
+    avSearch.Font = Enum.Font.GothamMedium; avSearch.TextSize = 12
+    avSearch.TextXAlignment = Enum.TextXAlignment.Left
+    avSearch.ClearTextOnFocus = false; avSearch.ZIndex = 102
+
+    -- divider
+    local avDiv = Instance.new("Frame", av)
+    avDiv.Size = UDim2.new(1,-20,0,1); avDiv.Position = UDim2.new(0,10,0,112)
+    avDiv.BackgroundColor3 = Color3.fromRGB(35,42,62)
+    avDiv.BorderSizePixel = 0; avDiv.ZIndex = 101
+
+    -- ── Player list ───────────────────────────────────────────
+    local avList = Instance.new("ScrollingFrame", av)
+    avList.Size = UDim2.new(1,0,0,AV_H-120); avList.Position = UDim2.new(0,0,0,118)
+    avList.BackgroundTransparency = 1; avList.BorderSizePixel = 0
+    avList.ScrollBarThickness = 3
+    avList.ScrollBarImageColor3 = Color3.fromRGB(40,60,120)
+    avList.CanvasSize = UDim2.new(0,0,0,0)
+    avList.AutomaticCanvasSize = Enum.AutomaticSize.Y; avList.ZIndex = 101
+    local avPad = Instance.new("UIPadding", avList)
+    avPad.PaddingLeft = UDim.new(0,10); avPad.PaddingRight = UDim.new(0,10)
+    avPad.PaddingTop = UDim.new(0,6)
+    local avLayout = Instance.new("UIListLayout", avList)
+    avLayout.Padding = UDim.new(0,4); avLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    -- section header
+    local listHdr = Instance.new("TextLabel", avList)
+    listHdr.Size = UDim2.new(1,0,0,16); listHdr.BackgroundTransparency = 1
+    listHdr.Text = "PLAYERS IN SERVER"; listHdr.LayoutOrder = 0
+    listHdr.TextColor3 = Color3.fromRGB(50,60,90)
+    listHdr.Font = Enum.Font.GothamBold; listHdr.TextSize = 9
+    listHdr.TextXAlignment = Enum.TextXAlignment.Left; listHdr.ZIndex = 102
+
+    -- ── Full-screen spectate overlay (parented to sg, above everything) ──
+    -- ── Aim line overlay — glowing layered laser ────────────────
+    -- Outer glow (wide, semi-transparent)
+    local aimGlow = Instance.new("Frame", sg)
+    aimGlow.Name             = "AV_AimLine"   -- used for cleanup
+    aimGlow.AnchorPoint      = Vector2.new(0, 0.5)
+    aimGlow.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
+    aimGlow.BackgroundTransparency = 0.65
+    aimGlow.BorderSizePixel  = 0
+    aimGlow.ZIndex           = 498
+    aimGlow.Size             = UDim2.new(0, 0, 0, 7)
+    aimGlow.Visible          = false
+    Instance.new("UICorner", aimGlow).CornerRadius = UDim.new(0, 4)
+
+    -- Core line (thin, bright)
+    local aimLine = Instance.new("Frame", sg)
+    aimLine.Name             = "AV_AimLineCore"
+    aimLine.AnchorPoint      = Vector2.new(0, 0.5)
+    aimLine.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    aimLine.BackgroundTransparency = 0.1
+    aimLine.BorderSizePixel  = 0
+    aimLine.ZIndex           = 500
+    aimLine.Size             = UDim2.new(0, 0, 0, 2)
+    aimLine.Visible          = false
+    Instance.new("UICorner", aimLine).CornerRadius = UDim.new(0, 1)
+
+    -- Start dot (gun tip)
+    local dotStart = Instance.new("Frame", sg)
+    dotStart.Name            = "AV_DotStart"
+    dotStart.AnchorPoint     = Vector2.new(0.5, 0.5)
+    dotStart.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
+    dotStart.BorderSizePixel = 0
+    dotStart.ZIndex          = 501
+    dotStart.Size            = UDim2.new(0, 8, 0, 8)
+    dotStart.Visible         = false
+    Instance.new("UICorner", dotStart).CornerRadius = UDim.new(1, 0)
+
+    -- End dot (hit point / crosshair target)
+    local dotEnd = Instance.new("Frame", sg)
+    dotEnd.Name              = "AV_DotEnd"
+    dotEnd.AnchorPoint       = Vector2.new(0.5, 0.5)
+    dotEnd.BackgroundColor3  = Color3.fromRGB(255, 30, 30)
+    dotEnd.BorderSizePixel   = 0
+    dotEnd.ZIndex            = 501
+    dotEnd.Size              = UDim2.new(0, 10, 0, 10)
+    dotEnd.Visible           = false
+    Instance.new("UICorner", dotEnd).CornerRadius = UDim.new(1, 0)
+
+    -- ── STOP HUD (shown while spectating) ────────────────────
+    local stopHud = Instance.new("Frame", sg)
+    stopHud.Name            = "AV_StopHud"
+    stopHud.Size            = UDim2.new(0, 260, 0, 36)
+    stopHud.Position        = UDim2.new(0.5, -130, 0, 10)
+    stopHud.BackgroundColor3 = Color3.fromRGB(8, 10, 20)
+    stopHud.BackgroundTransparency = 0.15
+    stopHud.BorderSizePixel = 0
+    stopHud.ZIndex          = 501
+    stopHud.Visible         = false
+    Instance.new("UICorner", stopHud).CornerRadius = UDim.new(0, 8)
+
+    local stopHudTxt = Instance.new("TextLabel", stopHud)
+    stopHudTxt.Size               = UDim2.new(1, -80, 1, 0)
+    stopHudTxt.Position           = UDim2.new(0, 10, 0, 0)
+    stopHudTxt.BackgroundTransparency = 1
+    stopHudTxt.Text               = "SPECTATING: ?"
+    stopHudTxt.TextColor3         = Color3.fromRGB(100, 170, 255)
+    stopHudTxt.Font               = Enum.Font.GothamBold
+    stopHudTxt.TextSize           = 11
+    stopHudTxt.TextXAlignment     = Enum.TextXAlignment.Left
+    stopHudTxt.ZIndex             = 502
+
+    local stopBtn = Instance.new("TextButton", stopHud)
+    stopBtn.Size             = UDim2.new(0, 60, 0, 24)
+    stopBtn.Position         = UDim2.new(1, -68, 0.5, -12)
+    stopBtn.BackgroundColor3 = Color3.fromRGB(160, 30, 30)
+    stopBtn.Text             = "STOP"
+    stopBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+    stopBtn.Font             = Enum.Font.GothamBold
+    stopBtn.TextSize         = 11
+    stopBtn.BorderSizePixel  = 0
+    stopBtn.ZIndex           = 502
+    Instance.new("UICorner", stopBtn).CornerRadius = UDim.new(0, 5)
+
+    local function stopSpectating()
+        spectating       = nil
+        aimLine.Visible  = false
+        stopHud.Visible  = false
+        av.Visible       = true
+        task.defer(function()
+            local myHum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+            if myHum then CAM.CameraSubject = myHum end
+            CAM.CameraType = Enum.CameraType.Custom
+        end)
+    end
+
+    local function selectPlayer(p)
+        spectating = p
+        stopHudTxt.Text  = "SPECTATING: " .. p.Name
+        stopHud.Visible  = true
+        aimLine.Visible  = true
+        av.Visible       = false   -- hide the list panel
+    end
+
+    stopBtn.MouseButton1Click:Connect(stopSpectating)
+
+    -- Build a row per real server player
+    -- ── Player list builder (callable to refresh) ───────────────
+    local listConns = {}  -- connections from player rows, cleared on rebuild
+
+    local function rebuildList()
+        -- clear old rows and connections
+        for _, c in ipairs(listConns) do pcall(function() c:Disconnect() end) end
+        listConns = {}
+        for _, child in ipairs(avList:GetChildren()) do
+            if child:IsA("TextButton") then child:Destroy() end
+        end
+
+        local order = 1
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LP then
+                local rowColor = order%2==0 and Color3.fromRGB(18,22,36) or Color3.fromRGB(14,17,27)
+                local row = Instance.new("TextButton", avList)
+                row.Size = UDim2.new(1,0,0,42)
+                row.BackgroundColor3 = rowColor
+                row.BorderSizePixel = 0; row.LayoutOrder = order; row.ZIndex = 102
+                row.Text = ""; row.AutoButtonColor = false
+                Instance.new("UICorner", row).CornerRadius = UDim.new(0,6)
+
+                local dot = Instance.new("Frame", row)
+                dot.Size = UDim2.new(0,8,0,8); dot.Position = UDim2.new(0,10,0.5,-4)
+                dot.BackgroundColor3 = Color3.fromRGB(55,215,125)
+                dot.BorderSizePixel = 0; dot.ZIndex = 103
+                Instance.new("UICorner", dot).CornerRadius = UDim.new(1,0)
+
+                local nm = Instance.new("TextLabel", row)
+                nm.Size = UDim2.new(0,180,1,0); nm.Position = UDim2.new(0,26,0,0)
+                nm.BackgroundTransparency = 1; nm.Text = p.Name
+                nm.TextColor3 = Color3.fromRGB(210,220,240); nm.Font = Enum.Font.GothamMedium
+                nm.TextSize = 12; nm.TextXAlignment = Enum.TextXAlignment.Left; nm.ZIndex = 103
+
+                local specBtn = Instance.new("TextButton", row)
+                specBtn.Size = UDim2.new(0,72,0,26); specBtn.Position = UDim2.new(1,-80,0.5,-13)
+                specBtn.BackgroundColor3 = Color3.fromRGB(25,55,110)
+                specBtn.Text = "SPECTATE"; specBtn.TextColor3 = Color3.fromRGB(100,170,255)
+                specBtn.Font = Enum.Font.GothamBold; specBtn.TextSize = 9
+                specBtn.BorderSizePixel = 0; specBtn.ZIndex = 103
+                Instance.new("UICorner", specBtn).CornerRadius = UDim.new(0,5)
+
+                local o = order  -- capture for closure
+                table.insert(listConns, specBtn.MouseButton1Click:Connect(function()
+                    selectPlayer(p)
+                end))
+                table.insert(listConns, row.MouseEnter:Connect(function()
+                    TweenService:Create(row, TweenInfo.new(0.12),
+                        {BackgroundColor3 = Color3.fromRGB(28,35,58)}):Play()
+                end))
+                table.insert(listConns, row.MouseLeave:Connect(function()
+                    TweenService:Create(row, TweenInfo.new(0.12),
+                        {BackgroundColor3 = rowColor}):Play()
+                end))
+
+                order = order + 1
+            end
+        end
+        -- show empty state if no other players
+        if order == 1 then
+            local empty = Instance.new("TextLabel", avList)
+            empty.Size = UDim2.new(1,0,0,40); empty.LayoutOrder = 1
+            empty.BackgroundTransparency = 1
+            empty.Text = "No other players in server"
+            empty.TextColor3 = Color3.fromRGB(60,70,100)
+            empty.Font = Enum.Font.Gotham; empty.TextSize = 11
+            empty.ZIndex = 102
+        end
+    end
+
+    rebuildList()
+
+    -- Auto-refresh: PlayerAdded / PlayerRemoving + every 30s
+    local paConn = Players.PlayerAdded:Connect(function()
+        task.wait(1)  -- small delay so character can load
+        if LAYER == "aimviewer" and av.Parent then rebuildList() end
+    end)
+    local prConn = Players.PlayerRemoving:Connect(function()
+        task.wait(0.1)
+        if LAYER == "aimviewer" and av.Parent then rebuildList() end
+    end)
+    local refreshTimer = 0
+    local timerConn = RunService.Heartbeat:Connect(function(dt)
+        if LAYER ~= "aimviewer" or not av.Parent then return end
+        refreshTimer = refreshTimer + dt
+        if refreshTimer >= 30 then
+            refreshTimer = 0
+            rebuildList()
+        end
+    end)
+    -- disconnect these when AimViewer is destroyed
+    local _oldDestroy = destroyAimViewer
+    destroyAimViewer = function()
+        pcall(function() paConn:Disconnect() end)
+        pcall(function() prConn:Disconnect() end)
+        pcall(function() timerConn:Disconnect() end)
+        for _, c in ipairs(listConns) do pcall(function() c:Disconnect() end) end
+        _oldDestroy()
+    end
+
+    -- ── Camera + aim line renderer ───────────────────────────
+    -- Swap CameraSubject to the spectated player's Humanoid.
+    -- This gives Roblox's native third-person camera for free —
+    -- mouse look, scroll zoom, collision, everything works normally.
+    local origSubject = CAM.CameraSubject
+    local origType    = CAM.CameraType
+
+    local function applySpectateCamera()
+        if not spectating or not spectating.Character then return end
+        local hum = spectating.Character:FindFirstChildOfClass("Humanoid")
+        if hum then
+            CAM.CameraType    = Enum.CameraType.Custom
+            CAM.CameraSubject = hum
+        end
+    end
+
+    -- aim line only — camera is fully native now
+    avConn = RunService.Heartbeat:Connect(function()
+        if not spectating or not spectating.Character then
+            aimLine.Visible = false; aimGlow.Visible = false
+            return
+        end
+
+        -- keep subject locked in case Roblox resets it
+        local hum = spectating.Character:FindFirstChildOfClass("Humanoid")
+        if hum and CAM.CameraSubject ~= hum then
+            CAM.CameraType    = Enum.CameraType.Custom
+            CAM.CameraSubject = hum
+        end
+
+        local char = spectating.Character
+        local hrp  = char:FindFirstChild("HumanoidRootPart")
+        if not hrp then
+            aimLine.Visible = false; aimGlow.Visible = false
+            return
+        end
+
+        -- ── Line start: RightHand bone ──────────────────────────
+        local rh = char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm")
+        local lineStart = rh and rh.Position
+            or (hrp.Position + hrp.CFrame.RightVector * 1.2 + hrp.CFrame.LookVector * 0.5)
+
+        -- ── Line end: raycast forward from HRP ───────────────
+        local rayOrigin = hrp.Position + hrp.CFrame.LookVector * 2
+        local rayDir    = hrp.CFrame.LookVector * 500
+        local rp = RaycastParams.new()
+        rp.FilterDescendantsInstances = {char}
+        rp.FilterType = Enum.RaycastFilterType.Exclude
+        local hit     = workspace:Raycast(rayOrigin, rayDir, rp)
+        local lineEnd = hit and hit.Position or (rayOrigin + rayDir)
+
+        -- ── Project start + end, draw one clean line ─────────
+        local sSP, sVis = CAM:WorldToScreenPoint(lineStart)
+        local eSP, eVis = CAM:WorldToScreenPoint(lineEnd)
+
+        if sVis and sSP.Z > 0 and eSP.Z > 0 then
+            local dx    = eSP.X - sSP.X
+            local dy    = eSP.Y - sSP.Y
+            local len   = math.sqrt(dx*dx + dy*dy)
+            local angle = math.deg(math.atan2(dy, dx))
+            -- glow
+            aimGlow.Visible  = true
+            aimGlow.Position = UDim2.new(0, sSP.X, 0, sSP.Y)
+            aimGlow.Size     = UDim2.new(0, len, 0, 6)
+            aimGlow.Rotation = angle
+            -- core
+            aimLine.Visible  = true
+            aimLine.Position = UDim2.new(0, sSP.X, 0, sSP.Y)
+            aimLine.Size     = UDim2.new(0, len, 0, 2)
+            aimLine.Rotation = angle
+        else
+            aimLine.Visible = false
+            aimGlow.Visible = false
+        end
+    end)
+
+    -- hook selectPlayer to apply camera immediately on SPECTATE click
+    local _origSelect = selectPlayer
+    selectPlayer = function(p)
+        _origSelect(p)
+        applySpectateCamera()
+    end
+
+    local origDestroyAV = destroyAimViewer
+    destroyAimViewer = function()
+        CAM.CameraSubject = origSubject
+        CAM.CameraType    = origType
+        task.defer(function() CAM.CameraType = Enum.CameraType.Custom end)
+        pcall(function() aimGlow:Destroy() end)
+        pcall(function() aimLine:Destroy() end)
+        pcall(function() stopHud:Destroy() end)
+        origDestroyAV()
+    end
+
+    -- ── Secret unlock ─────────────────────────────────────────
+    avSearch:GetPropertyChangedSignal("Text"):Connect(function()
+        if avSearch.Text == "Triggerbot" then
+            -- destroy AimViewer entirely then show TriggerBot
+            destroyAimViewer()
+            LAYER = "triggerbot"
+            win.Size = UDim2.new(0, W, 0, 0)
+            win.BackgroundTransparency = 1
+            win.Visible = true
+            tw(win, {Size = UDim2.new(0,W,0,H), BackgroundTransparency = 0}, MED)
+        end
+    end)
+end
+
+-- ── returnToAimViewer (called by Settings button) ─────────────
+returnToAimViewer = function()
+    destroyTriggerBot()
+    buildAimViewer()
+end
+
+-- ── Kick off ──────────────────────────────────────────────────
+buildAimViewer()
+startLoop()
+print("AimViewer loaded. You know what to search.")
